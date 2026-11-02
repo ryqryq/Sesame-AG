@@ -1,0 +1,174 @@
+
+name: Sesame-AG Manual Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sesame-ag-manual-build
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  ANDROID_PLATFORM: "android-37"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+
+jobs:
+  build:
+    name: Build and Sign APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Build Release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Sign APK with Personal Keystore
+        id: sign
+        uses: ilharp/sign-android-release@v2
+        with:
+          releaseDir: app/build/outputs/apk/release
+          signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
+          keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
+
+      - name: Verify Personal Signature
+        shell: bash
+        env:
+          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          keystore="${RUNNER_TEMP}/personal-release.jks"
+          printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > "$keystore"
+
+          expected="$(
+            keytool -exportcert \
+              -keystore "$keystore" \
+              -alias "$ANDROID_KEY_ALIAS" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" |
+            openssl dgst -sha256 -binary |
+            xxd -p -c 256 |
+            tr '[:lower:]' '[:upper:]'
+          )"
+
+          apksigner="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+
+          IFS=':' read -r -a files <<< "$SIGNED_FILES"
+          count=0
+
+          for apk in "${files[@]}"; do
+            [ -f "$apk" ] || continue
+
+            result="$("$apksigner" verify --verbose --print-certs "$apk")"
+
+            actual="$(
+              printf '%s\n' "$result" |
+              awk -F': ' '/certificate SHA-256 digest:/ {
+                gsub(/:/, "", $NF)
+                print toupper($NF)
+              }'
+            )"
+
+            if [ "$actual" != "$expected" ]; then
+              echo "APK signature does not match personal keystore!"
+              exit 1
+            fi
+
+            echo "Signature verified: $(basename "$apk")"
+            count=$((count + 1))
+          done
+
+          if [ "$count" -eq 0 ]; then
+            echo "No signed APK found!"
+            exit 1
+          fi
+
+          rm -f "$keystore"
+
+      - name: Prepare Encrypted ZIP
+        shell: bash
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y 7zip
+
+          mkdir -p release-assets
+
+          IFS=':' read -r -a files <<< "$SIGNED_FILES"
+
+          for apk in "${files[@]}"; do
+            [ -f "$apk" ] || continue
+            cp "$apk" release-assets/
+          done
+
+          cd release-assets
+          sha256sum -- *.apk > SHA256SUMS
+
+          cat > README.txt <<'EOF'
+          Sesame-AG Personal Build
+
+          Package name: io.github.aoguai.sesameag
+          Signature: Personal Keystore
+          Encryption: AES-256 ZIP
+
+          Please keep your Keystore safe.
+          Future updates must use the same Keystore.
+          EOF
+
+          7zz a -tzip -mem=AES256 \
+            -p"$ARTIFACT_PASSWORD" \
+            "$RUNNER_TEMP/Sesame-AG-Personal-Build.zip" \
+            .
+
+      - name: Upload Encrypted ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: Sesame-AG-Personal-Build
+          path: ${{ runner.temp }}/Sesame-AG-Personal-Build.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
