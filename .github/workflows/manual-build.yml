@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sesame-ag-manual-build
+  group: manual-build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -18,12 +18,17 @@ env:
   ANDROID_API_LEVEL: "37"
   ANDROID_PLATFORM: "android-37.0"
   ANDROID_BUILD_TOOLS: "37.0.0"
+  LOCAL_GRADLE_VERSION: "9.5.1"
+  LOCAL_AGP_VERSION: "9.2.1"
+  LOCAL_KOTLIN_VERSION: "2.2.10"
   RELEASE_DIR: app/build/outputs/apk/release
   STAGING_DIR: app/build/outputs/apk/all
+  ASSET_DIR: app/build/outputs/apk/release-assets
+  ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
 
 jobs:
   build:
-    name: Build and Sign APK
+    name: Build, Sign and Package APKs
     runs-on: ubuntu-latest
 
     steps:
@@ -104,7 +109,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf "${STAGING_DIR}"
+
+          rm -rf "${STAGING_DIR}" "${ASSET_DIR}"
           mkdir -p "${STAGING_DIR}"
 
           mapfile -t apks < <(
@@ -112,7 +118,7 @@ jobs:
           )
 
           if [[ ${#apks[@]} -eq 0 ]]; then
-            echo "No release APKs found" >&2
+            echo "No release APKs found in ${RELEASE_DIR}" >&2
             exit 1
           fi
 
@@ -138,111 +144,159 @@ jobs:
           ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          keystore="${RUNNER_TEMP}/personal-release.jks"
-          trap 'rm -f "$keystore"' EXIT
+          android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          apksigner_path="${android_sdk_root}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
 
-          printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > "$keystore"
-
-          expected="$(
-            keytool -exportcert \
-              -keystore "$keystore" \
-              -alias "$ANDROID_KEY_ALIAS" \
-              -storepass "$ANDROID_KEYSTORE_PASSWORD" |
-            openssl dgst -sha256 -binary |
-            xxd -p -c 256 |
-            tr '[:lower:]' '[:upper:]'
-          )"
-
-          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          apksigner="${sdk_root}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-
-          if [[ ! -x "$apksigner" ]]; then
-            echo "Cannot find apksigner" >&2
+          if [[ ! -x "${apksigner_path}" ]]; then
+            echo "Unable to locate apksigner" >&2
             exit 1
           fi
 
-          IFS=':' read -r -a files <<< "$SIGNED_FILES"
+          keystore_path="${RUNNER_TEMP}/personal-signing.keystore"
+          trap 'rm -f "${keystore_path}"' EXIT
+
+          printf '%s' "${ANDROID_SIGNING_KEY}" | base64 --decode > "${keystore_path}"
+
+          expected_fingerprint="$(
+            keytool -list -v \
+              -keystore "${keystore_path}" \
+              -alias "${ANDROID_KEY_ALIAS}" \
+              -storepass "${ANDROID_KEYSTORE_PASSWORD}" \
+              -keypass "${ANDROID_KEY_PASSWORD}" 2>/dev/null |
+            awk -F': ' '/SHA256:/ {
+              gsub(/:/, "", $2)
+              print toupper($2)
+              exit
+            }'
+          )"
+
+          if [[ ! "${expected_fingerprint}" =~ ^[0-9A-F]{64}$ ]]; then
+            echo "Failed to read personal certificate SHA-256 fingerprint" >&2
+            exit 1
+          fi
+
+          IFS=':' read -r -a files <<< "${SIGNED_FILES}"
           verified=0
 
-          for apk in "${files[@]}"; do
-            [[ -f "$apk" ]] || {
-              echo "Signed APK missing: $apk" >&2
-              exit 1
-            }
+          for file in "${files[@]}"; do
+            [[ -n "${file}" ]] || continue
 
-            result="$("$apksigner" verify --verbose --print-certs "$apk")"
-
-            actual="$(
-              printf '%s\n' "$result" |
-              awk -F': ' '/certificate SHA-256 digest:/ {
-                gsub(/:/, "", $NF)
-                print toupper($NF)
-              }'
-            )"
-
-            if [[ "$actual" != "$expected" ]]; then
-              echo "Personal signature verification failed!" >&2
-              echo "Expected: $expected" >&2
-              echo "Actual: $actual" >&2
+            if [[ ! -f "${file}" ]]; then
+              echo "Signed APK is missing: ${file}" >&2
               exit 1
             fi
 
-            echo "Verified: $(basename "$apk")"
+            cert_output="$(
+              "${apksigner_path}" verify --verbose --print-certs "${file}"
+            )"
+
+            mapfile -t fingerprints < <(
+              printf '%s\n' "${cert_output}" |
+              awk -F': ' '/certificate SHA-256 digest:/ {
+                digest=$NF
+                gsub(/:/, "", digest)
+                print toupper(digest)
+              }'
+            )
+
+            if [[ ${#fingerprints[@]} -ne 1 ||
+                  "${fingerprints[0]}" != "${expected_fingerprint}" ]]; then
+              echo "Unexpected signing certificate: ${file}" >&2
+              echo "Personal certificate verification failed." >&2
+              exit 1
+            fi
+
+            echo "Signature verified: $(basename "${file}")"
             verified=$((verified + 1))
           done
 
-          if [[ $verified -eq 0 ]]; then
-            echo "No signed APKs found!" >&2
+          if [[ ${verified} -eq 0 ]]; then
+            echo "No signed APKs were provided by the signing action" >&2
             exit 1
           fi
 
-      - name: Prepare Encrypted ZIP
+          echo "All ${verified} APK signatures verified successfully."
+
+      - name: Prepare Release Assets
         shell: bash
         env:
-          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
           SIGNED_FILES: ${{ steps.sign_apks.outputs.signedFiles }}
         run: |
           set -euo pipefail
 
-          sudo apt-get update
-          sudo apt-get install -y 7zip
+          mkdir -p "${ASSET_DIR}"
 
-          mkdir -p "${RUNNER_TEMP}/release-assets"
+          IFS=':' read -r -a files <<< "${SIGNED_FILES}"
+          copied=0
 
-          IFS=':' read -r -a files <<< "$SIGNED_FILES"
+          for file in "${files[@]}"; do
+            [[ -n "${file}" ]] || continue
 
-          for apk in "${files[@]}"; do
-            [[ -f "$apk" ]] || continue
-            cp "$apk" "${RUNNER_TEMP}/release-assets/"
+            cp "${file}" "${ASSET_DIR}/"
+            copied=$((copied + 1))
           done
 
-          cd "${RUNNER_TEMP}/release-assets"
+          if [[ ${copied} -eq 0 ]]; then
+            echo "No signed APKs were produced" >&2
+            exit 1
+          fi
 
-          sha256sum -- *.apk > SHA256SUMS
+          (
+            cd "${ASSET_DIR}"
+            sha256sum -- *.apk > SHA256SUMS
+          )
 
-          cat > README.txt <<'EOF'
+          cat > "${ASSET_DIR}/README.txt" <<'EOF'
           Sesame-AG Personal Build
 
-          Package name: io.github.aoguai.sesameag
-          Signature: Personal Keystore
-          ZIP encryption: AES-256
+          APK files in this package have been signed with a personal signing certificate.
 
-          Future updates must use the same personal Keystore.
+          Package name: io.github.aoguai.sesameag
+
+          Verify APK checksums with:
+          sha256sum -c SHA256SUMS
+
+          Note:
+          This build uses a personal signing certificate, not the official project certificate.
+          It cannot directly update an installation signed with the official certificate.
           EOF
 
-          7zz a -tzip -mem=AES256 \
-            "-p${ARTIFACT_PASSWORD}" \
-            "${RUNNER_TEMP}/Sesame-AG-Personal-Build.zip" \
-            .
+      - name: Package APK Artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ARTIFACT_PASSWORD}" ]]; then
+            echo "ARTIFACT_PASSWORD is not configured" >&2
+            exit 1
+          fi
+
+          if ! command -v zip >/dev/null 2>&1; then
+            echo "The zip command is not available on this runner" >&2
+            exit 1
+          fi
+
+          artifact_path="${RUNNER_TEMP}/Sesame-AG-${GITHUB_RUN_NUMBER}.zip"
+
+          (
+            cd "${ASSET_DIR}"
+            zip -r -P "${ARTIFACT_PASSWORD}" "${artifact_path}" .
+          )
+
+          echo "Encrypted ZIP created successfully."
+          echo "Artifact: ${artifact_path}"
+
+          echo "ARTIFACT_PATH=${artifact_path}" >> "$GITHUB_ENV"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Sesame-AG-Personal-Build
-          path: ${{ runner.temp }}/Sesame-AG-Personal-Build.zip
+          name: Sesame-AG-Personal-${{ github.run_number }}
           archive: false
+          path: ${{ env.ARTIFACT_PATH }}
           if-no-files-found: error
           retention-days: 14
