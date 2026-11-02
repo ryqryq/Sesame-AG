@@ -13,8 +13,13 @@ concurrency:
 
 env:
   CI: "true"
-  ANDROID_PLATFORM: "android-37"
+  JAVA_DISTRIBUTION: "oracle"
+  JAVA_VERSION: "17.0.1"
+  ANDROID_API_LEVEL: "37"
+  ANDROID_PLATFORM: "android-37.0"
   ANDROID_BUILD_TOOLS: "37.0.0"
+  RELEASE_DIR: app/build/outputs/apk/release
+  STAGING_DIR: app/build/outputs/apk/all
 
 jobs:
   build:
@@ -22,29 +27,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Source
+      - name: Set Timezone to Asia/Shanghai
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "Current time: $(date)"
+
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.ref }}
 
-      - name: Set up JDK 17
+      - name: Set up JDK
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: "17"
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          check-latest: false
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
-
-      - name: Install Android SDK Packages
+      - name: Pin Gradle Java Home
+        shell: bash
         run: |
+          set -euo pipefail
+          echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Required Android SDK Packages
+        shell: bash
+        run: |
+          set -euo pipefail
           sdkmanager --install \
             "platform-tools" \
             "platforms;${ANDROID_PLATFORM}" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
+
           set +o pipefail
           yes | sdkmanager --licenses >/dev/null
           set -o pipefail
@@ -52,28 +76,65 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
+          cache-read-only: false
           gradle-version: wrapper
 
-      - name: Build Release APK
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Print Toolchain Versions
+        shell: bash
         run: |
-          chmod +x gradlew
+          set -euo pipefail
+          echo "JAVA_HOME=${JAVA_HOME}"
+          echo "ORG_GRADLE_JAVA_HOME=${ORG_GRADLE_JAVA_HOME}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          java -version
+          sdkmanager --version
+          ./gradlew --version
+
+      - name: Build Release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
           ./gradlew --no-daemon --stacktrace assembleRelease
 
-      - name: Sign APK with Personal Keystore
-        id: sign
+      - name: Stage Unsigned APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${STAGING_DIR}"
+          mkdir -p "${STAGING_DIR}"
+
+          mapfile -t apks < <(
+            find "${RELEASE_DIR}" -maxdepth 1 -type f -name "*.apk" | sort
+          )
+
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "No release APKs found" >&2
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            cp "${apk}" "${STAGING_DIR}/"
+          done
+
+      - name: Sign APKs
+        id: sign_apks
         uses: ilharp/sign-android-release@v2
         with:
-          releaseDir: app/build/outputs/apk/release
+          releaseDir: ${{ env.STAGING_DIR }}
           signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
           keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
           buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
 
-      - name: Verify Personal Signature
+      - name: Verify Personal APK Signatures
         shell: bash
         env:
-          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+          SIGNED_FILES: ${{ steps.sign_apks.outputs.signedFiles }}
           ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -81,6 +142,8 @@ jobs:
           set -euo pipefail
 
           keystore="${RUNNER_TEMP}/personal-release.jks"
+          trap 'rm -f "$keystore"' EXIT
+
           printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > "$keystore"
 
           expected="$(
@@ -93,13 +156,22 @@ jobs:
             tr '[:lower:]' '[:upper:]'
           )"
 
-          apksigner="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          apksigner="${sdk_root}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+
+          if [[ ! -x "$apksigner" ]]; then
+            echo "Cannot find apksigner" >&2
+            exit 1
+          fi
 
           IFS=':' read -r -a files <<< "$SIGNED_FILES"
-          count=0
+          verified=0
 
           for apk in "${files[@]}"; do
-            [ -f "$apk" ] || continue
+            [[ -f "$apk" ]] || {
+              echo "Signed APK missing: $apk" >&2
+              exit 1
+            }
 
             result="$("$apksigner" verify --verbose --print-certs "$apk")"
 
@@ -111,43 +183,44 @@ jobs:
               }'
             )"
 
-            if [ "$actual" != "$expected" ]; then
-              echo "APK signature does not match personal keystore!"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Personal signature verification failed!" >&2
+              echo "Expected: $expected" >&2
+              echo "Actual: $actual" >&2
               exit 1
             fi
 
-            echo "Signature verified: $(basename "$apk")"
-            count=$((count + 1))
+            echo "Verified: $(basename "$apk")"
+            verified=$((verified + 1))
           done
 
-          if [ "$count" -eq 0 ]; then
-            echo "No signed APK found!"
+          if [[ $verified -eq 0 ]]; then
+            echo "No signed APKs found!" >&2
             exit 1
           fi
-
-          rm -f "$keystore"
 
       - name: Prepare Encrypted ZIP
         shell: bash
         env:
           ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
-          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+          SIGNED_FILES: ${{ steps.sign_apks.outputs.signedFiles }}
         run: |
           set -euo pipefail
 
           sudo apt-get update
           sudo apt-get install -y 7zip
 
-          mkdir -p release-assets
+          mkdir -p "${RUNNER_TEMP}/release-assets"
 
           IFS=':' read -r -a files <<< "$SIGNED_FILES"
 
           for apk in "${files[@]}"; do
-            [ -f "$apk" ] || continue
-            cp "$apk" release-assets/
+            [[ -f "$apk" ]] || continue
+            cp "$apk" "${RUNNER_TEMP}/release-assets/"
           done
 
-          cd release-assets
+          cd "${RUNNER_TEMP}/release-assets"
+
           sha256sum -- *.apk > SHA256SUMS
 
           cat > README.txt <<'EOF'
@@ -155,18 +228,17 @@ jobs:
 
           Package name: io.github.aoguai.sesameag
           Signature: Personal Keystore
-          Encryption: AES-256 ZIP
+          ZIP encryption: AES-256
 
-          Please keep your Keystore safe.
-          Future updates must use the same Keystore.
+          Future updates must use the same personal Keystore.
           EOF
 
           7zz a -tzip -mem=AES256 \
-            -p"$ARTIFACT_PASSWORD" \
-            "$RUNNER_TEMP/Sesame-AG-Personal-Build.zip" \
+            "-p${ARTIFACT_PASSWORD}" \
+            "${RUNNER_TEMP}/Sesame-AG-Personal-Build.zip" \
             .
 
-      - name: Upload Encrypted ZIP
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v7
         with:
           name: Sesame-AG-Personal-Build
